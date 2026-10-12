@@ -2,10 +2,12 @@ import typer
 from pathlib import Path
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
+from rich.markdown import Markdown
 
 from . import __version__
-from .utils import ensure_dirs, OUT_DIR, ok, err, info
-from . import fetcher, parser, extractor, splitter, analyzer, backup, exporter
+from .utils import ensure_dirs, OUT_DIR, RAW_DIR, ok, err, info, warn
+from . import fetcher, parser, extractor, splitter, analyzer, backup, exporter, tools
 from . import timeline as timeline_mod
 
 app = typer.Typer(help="DeepSeek Chat Extractor CLI", add_completion=False)
@@ -112,6 +114,35 @@ def stats(file: Path = typer.Argument(..., exists=True)):
 
 
 @app.command()
+def stats_all():
+    """إحصائيات كل المحادثات في جدول واحد."""
+    files = tools.find_all_raw()
+    if not files:
+        info("مفيش محادثات محفوظة")
+        return
+    table = Table("المحادثة", "الرسائل", "USER", "ASSISTANT", "التوكنز")
+    total = {"msgs": 0, "u": 0, "a": 0, "tok": 0}
+    for f in files:
+        try:
+            data = parser.load(f)
+            msgs = parser.get_messages(data)
+            u = sum(1 for m in msgs if m.get("role") == "USER")
+            a = sum(1 for m in msgs if m.get("role") == "ASSISTANT")
+            tok = sum(m.get("accumulated_token_usage") or 0 for m in msgs)
+            table.add_row(f.stem, str(len(msgs)), str(u), str(a), f"{tok:,}")
+            total["msgs"] += len(msgs)
+            total["u"] += u
+            total["a"] += a
+            total["tok"] += tok
+        except Exception as e:
+            table.add_row(f.stem, "❌", str(e)[:30], "", "")
+    table.add_row("[bold]الإجمالي[/bold]", f"[bold]{total['msgs']}[/bold]",
+                  f"[bold]{total['u']}[/bold]", f"[bold]{total['a']}[/bold]",
+                  f"[bold]{total['tok']:,}[/bold]")
+    console.print(table)
+
+
+@app.command()
 def split(
     file: Path = typer.Argument(..., exists=True),
     by_messages: int = typer.Option(None, "--by-messages", "-m"),
@@ -133,6 +164,21 @@ def split(
     else:
         files = splitter.split_by_size(data, out_dir, by_size, only, fmt)
     ok(f"تم التقسيم: {len(files)} ملف في {out_dir}")
+
+
+@app.command()
+def merge(
+    input_dir: Path = typer.Argument(..., exists=True),
+    out: Path = typer.Option(None, "--out", "-o"),
+    pattern: str = typer.Option("*.md", "--pattern", "-p"),
+):
+    """دمج ملفات مقسمة لملف واحد."""
+    if out is None:
+        out = OUT_DIR / f"{input_dir.name}_merged.md"
+    tools.merge_files(input_dir, out, pattern)
+    if out.exists():
+        size = out.stat().st_size
+        ok(f"تم الدمج: {out} ({size:,} بايت)")
 
 
 @app.command()
@@ -257,6 +303,63 @@ def grep(
     info(f"إجمالي الملفات المطابقة: {hits}")
 
 
+@app.command()
+def diff(
+    file_a: Path = typer.Argument(..., exists=True),
+    file_b: Path = typer.Argument(..., exists=True),
+):
+    """مقارنة ملفين نصيين."""
+    d = tools.diff_two_files(file_a, file_b)
+    table = Table("المقياس", str(file_a.name), str(file_b.name))
+    table.add_row("الأسطر", str(d["lines_a"]), str(d["lines_b"]))
+    table.add_row("أسطر فريدة", str(d["unique_a"]), str(d["unique_b"]))
+    console.print(table)
+
+    if d["only_a"]:
+        console.print(f"\n[bold]فقط في {file_a.name}:[/bold]")
+        for l in d["only_a"][:10]:
+            console.print(f"  [red]- {l[:120]}[/red]")
+    if d["only_b"]:
+        console.print(f"\n[bold]فقط في {file_b.name}:[/bold]")
+        for l in d["only_b"][:10]:
+            console.print(f"  [green]+ {l[:120]}[/green]")
+
+
+@app.command()
+def clean():
+    """تنظيف الملفات المؤقتة."""
+    count = tools.clean_temp()
+    ok(f"تم حذف {count} ملف مؤقت")
+
+
+@app.command()
+def summary(file: Path = typer.Argument(..., exists=True)):
+    """ملخص شامل للمحادثة (إحصائيات + كلمات + زمنية)."""
+    data = parser.load(file)
+    msgs = parser.get_messages(data)
+    title = parser.get_title(data)
+    users = sum(1 for m in msgs if m.get("role") == "USER")
+    asst = sum(1 for m in msgs if m.get("role") == "ASSISTANT")
+    tokens = sum(m.get("accumulated_token_usage") or 0 for m in msgs)
+    dur = timeline_mod.duration(data)
+    kws = analyzer.extract_keywords(data, 10)
+    ps = analyzer.extract_paths(data)
+
+    console.print(Panel.fit(
+        f"[bold]📄 {title}[/bold]\n\n"
+        f"عدد الرسائل: {len(msgs)}\n"
+        f"USER: {users}  |  ASSISTANT: {asst}\n"
+        f"التوكنز: {tokens:,}\n"
+        f"المسارات المكتشفة: {len(ps)}\n"
+        f"المدة: {dur.get('duration_hours', '?')} ساعة",
+        title="ملخص المحادثة",
+    ))
+
+    console.print("\n[bold]🔝 أكثر الكلمات:[/bold]")
+    for w, c in kws:
+        console.print(f"  • {w} ({c})")
+
+
 # ============ أوامر Koofr / rclone ============
 
 backup_app = typer.Typer(help="رفع/تنزيل/مزامنة مع Koofr عبر rclone")
@@ -329,6 +432,17 @@ def backup_pull(
 ):
     """تنزيل من Koofr."""
     backup.download(remote_path, local, remote)
+
+
+@backup_app.command("push-all")
+def backup_push_all(
+    dry: bool = typer.Option(False, "--dry-run"),
+):
+    """رفع كل حاجة (raw + output) على Koofr."""
+    info("⬆️  رفع الكل لـ Koofr...")
+    backup.upload_raw(dry_run=dry)
+    backup.upload_output(dry_run=dry)
+    ok("تم رفع كل حاجة")
 
 
 if __name__ == "__main__":
