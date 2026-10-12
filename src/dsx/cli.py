@@ -5,7 +5,7 @@ from rich.table import Table
 
 from . import __version__
 from .utils import ensure_dirs, OUT_DIR, ok, err, info
-from . import fetcher, parser, extractor
+from . import fetcher, parser, extractor, splitter, analyzer
 
 app = typer.Typer(help="DeepSeek Chat Extractor CLI", add_completion=False)
 console = Console()
@@ -28,8 +28,9 @@ def fetch(
 
 
 @app.command()
-def parse(file: Path = typer.Argument(..., exists=True, help="ملف JSON خام")):
+def parse(file: Path = typer.Argument(..., exists=True)):
     """عرض بنية المحادثة."""
+    from collections import Counter
     data = parser.load(file)
     msgs = parser.get_messages(data)
     title = parser.get_title(data)
@@ -39,17 +40,15 @@ def parse(file: Path = typer.Argument(..., exists=True, help="ملف JSON خام
     users = sum(1 for m in msgs if m.get("role") == "USER")
     asst = sum(1 for m in msgs if m.get("role") == "ASSISTANT")
 
-    # إحصاء أنواع fragments
-    from collections import Counter
-    types = Counter()
-    for m in msgs:
-        for f in m.get("fragments", []):
-            types[f.get("type", "?")] += 1
-
     table = Table("الدور", "العدد")
     table.add_row("USER", str(users))
     table.add_row("ASSISTANT", str(asst))
     console.print(table)
+
+    types = Counter()
+    for m in msgs:
+        for f in m.get("fragments", []):
+            types[f.get("type", "?")] += 1
 
     t2 = Table("نوع الـ fragment", "العدد")
     for t, c in types.most_common():
@@ -64,11 +63,11 @@ def extract(
         "clean", "--only", "-o",
         help="clean|all|user|assistant|thinking|code|search|tools",
     ),
-    last: int = typer.Option(None, "--last", "-n", help="آخر N رسالة"),
-    range_: str = typer.Option(None, "--range", "-r", help="نطاق مثل 5:15"),
-    keyword: str = typer.Option(None, "--keyword", "-k", help="بحث بكلمة"),
-    fmt: str = typer.Option("md", "--format", "-f", help="md|txt|json"),
-    out: Path = typer.Option(None, "--out", help="ملف الخروج"),
+    last: int = typer.Option(None, "--last", "-n"),
+    range_: str = typer.Option(None, "--range", "-r"),
+    keyword: str = typer.Option(None, "--keyword", "-k"),
+    fmt: str = typer.Option("md", "--format", "-f"),
+    out: Path = typer.Option(None, "--out"),
 ):
     """استخراج رسائل بفلاتر."""
     ensure_dirs()
@@ -100,7 +99,6 @@ def stats(file: Path = typer.Argument(..., exists=True)):
     """إحصائيات المحادثة."""
     data = parser.load(file)
     msgs = parser.get_messages(data)
-
     users = sum(1 for m in msgs if m.get("role") == "USER")
     asst = sum(1 for m in msgs if m.get("role") == "ASSISTANT")
     tokens = sum(m.get("accumulated_token_usage") or 0 for m in msgs)
@@ -112,6 +110,90 @@ def stats(file: Path = typer.Argument(..., exists=True)):
     table.add_row("ASSISTANT", str(asst))
     table.add_row("التوكنز", f"{tokens:,}")
     console.print(table)
+
+
+@app.command()
+def split(
+    file: Path = typer.Argument(..., exists=True),
+    by_messages: int = typer.Option(None, "--by-messages", "-m", help="عدد الرسائل لكل جزء"),
+    by_size: float = typer.Option(None, "--by-size", "-s", help="أقصى حجم بالميجا لكل جزء"),
+    only: str = typer.Option("clean", "--only", "-o"),
+    fmt: str = typer.Option("md", "--format", "-f"),
+    out_dir: Path = typer.Option(None, "--out-dir"),
+):
+    """تقسيم محادثة ضخمة لملفات أصغر."""
+    ensure_dirs()
+    if not by_messages and not by_size:
+        err("حدد --by-messages أو --by-size")
+        raise SystemExit(1)
+
+    data = parser.load(file)
+    if out_dir is None:
+        out_dir = OUT_DIR / f"{file.stem}_parts"
+
+    if by_messages:
+        files = splitter.split_by_messages(data, out_dir, by_messages, only, fmt)
+    else:
+        files = splitter.split_by_size(data, out_dir, by_size, only, fmt)
+
+    ok(f"تم التقسيم: {len(files)} ملف في {out_dir}")
+
+
+@app.command()
+def paths(file: Path = typer.Argument(..., exists=True)):
+    """استخراج كل مسارات الملفات المذكورة في المحادثة."""
+    data = parser.load(file)
+    ps = analyzer.extract_paths(data)
+    out = OUT_DIR / f"{file.stem}_paths.txt"
+    out.write_text("\n".join(ps), encoding="utf-8")
+    ok(f"تم الحفظ: {out} ({len(ps)} مسار)")
+    for p in ps[:20]:
+        console.print(f"  • {p}")
+    if len(ps) > 20:
+        info(f"... و {len(ps) - 20} مسار آخر")
+
+
+@app.command()
+def tree(file: Path = typer.Argument(..., exists=True)):
+    """استخراج شجرة المشروع (├── └──)."""
+    data = parser.load(file)
+    lines = analyzer.extract_tree(data)
+    out = OUT_DIR / f"{file.stem}_tree.txt"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    ok(f"تم الحفظ: {out} ({len(lines)} سطر)")
+    for line in lines[:30]:
+        console.print(line)
+    if len(lines) > 30:
+        info(f"... و {len(lines) - 30} سطر آخر")
+
+
+@app.command()
+def keywords(
+    file: Path = typer.Argument(..., exists=True),
+    top: int = typer.Option(30, "--top", "-t"),
+):
+    """أكثر الكلمات تكرارًا في المحادثة."""
+    data = parser.load(file)
+    kws = analyzer.extract_keywords(data, top)
+    table = Table("الكلمة", "التكرار")
+    for w, c in kws:
+        table.add_row(w, str(c))
+    console.print(table)
+
+
+@app.command()
+def search(
+    file: Path = typer.Argument(..., exists=True),
+    keyword: str = typer.Argument(...),
+):
+    """بحث بكلمة في محادثة."""
+    data = parser.load(file)
+    hits = analyzer.search_in_messages(data, keyword)
+    console.print(f"[bold]نتائج البحث عن:[/bold] {keyword}  ({len(hits)} نتيجة)")
+    for i, role, snippet in hits[:30]:
+        console.print(f"[cyan]#{i}[/cyan] [{role}] {snippet}")
+    if len(hits) > 30:
+        info(f"... و {len(hits) - 30} نتيجة أخرى")
 
 
 if __name__ == "__main__":
