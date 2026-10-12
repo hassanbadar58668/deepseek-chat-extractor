@@ -1,0 +1,20 @@
+[project]
+name = "dsx"
+version = "0.1.0"
+description = "DeepSeek Chat Extractor CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13.7",
+    "requests>=2.31",
+]
+
+[project.scripts]
+dsx = "dsx.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
