@@ -5,7 +5,7 @@ from rich.table import Table
 
 from . import __version__
 from .utils import ensure_dirs, OUT_DIR, ok, err, info
-from . import fetcher, parser, extractor, splitter, analyzer
+from . import fetcher, parser, extractor, splitter, analyzer, backup
 
 app = typer.Typer(help="DeepSeek Chat Extractor CLI", add_completion=False)
 console = Console()
@@ -21,10 +21,14 @@ def version():
 def fetch(
     value: str = typer.Argument(..., help="رابط المشاركة أو ID"),
     token: str = typer.Option(None, "--token", "-t", help="توكن للجلسات الخاصة"),
+    upload: bool = typer.Option(False, "--upload", "-u", help="ارفع لـ Koofr تلقائياً"),
+    remote: str = typer.Option("koofr-dsx:dsx_backup/raw", "--remote"),
 ):
     """سحب محادثة وحفظها كـ JSON خام."""
     ensure_dirs()
-    fetcher.fetch(value, token)
+    out = fetcher.fetch(value, token)
+    if upload:
+        backup.upload(out, remote)
 
 
 @app.command()
@@ -59,10 +63,8 @@ def parse(file: Path = typer.Argument(..., exists=True)):
 @app.command()
 def extract(
     file: Path = typer.Argument(..., exists=True),
-    only: str = typer.Option(
-        "clean", "--only", "-o",
-        help="clean|all|user|assistant|thinking|code|search|tools",
-    ),
+    only: str = typer.Option("clean", "--only", "-o",
+        help="clean|all|user|assistant|thinking|code|search|tools"),
     last: int = typer.Option(None, "--last", "-n"),
     range_: str = typer.Option(None, "--range", "-r"),
     keyword: str = typer.Option(None, "--keyword", "-k"),
@@ -73,10 +75,8 @@ def extract(
     ensure_dirs()
     data = parser.load(file)
     msgs = extractor.filter_messages(data, only, last, range_, keyword)
-
     if out is None:
         out = OUT_DIR / f"{file.stem}_{only}.{fmt}"
-
     lines = []
     for m in msgs:
         role = m.get("role", "?")
@@ -89,7 +89,6 @@ def extract(
                 lines.append(f"=== {role} [{t}] ===\n{c}\n")
             else:
                 lines.append(c)
-
     out.write_text("\n".join(lines), encoding="utf-8")
     ok(f"تم الحفظ: {out}  ({len(msgs)} رسالة)")
 
@@ -102,7 +101,6 @@ def stats(file: Path = typer.Argument(..., exists=True)):
     users = sum(1 for m in msgs if m.get("role") == "USER")
     asst = sum(1 for m in msgs if m.get("role") == "ASSISTANT")
     tokens = sum(m.get("accumulated_token_usage") or 0 for m in msgs)
-
     table = Table("المقياس", "القيمة")
     table.add_row("عنوان", parser.get_title(data))
     table.add_row("إجمالي الرسائل", str(len(msgs)))
@@ -115,8 +113,8 @@ def stats(file: Path = typer.Argument(..., exists=True)):
 @app.command()
 def split(
     file: Path = typer.Argument(..., exists=True),
-    by_messages: int = typer.Option(None, "--by-messages", "-m", help="عدد الرسائل لكل جزء"),
-    by_size: float = typer.Option(None, "--by-size", "-s", help="أقصى حجم بالميجا لكل جزء"),
+    by_messages: int = typer.Option(None, "--by-messages", "-m"),
+    by_size: float = typer.Option(None, "--by-size", "-s"),
     only: str = typer.Option("clean", "--only", "-o"),
     fmt: str = typer.Option("md", "--format", "-f"),
     out_dir: Path = typer.Option(None, "--out-dir"),
@@ -126,22 +124,19 @@ def split(
     if not by_messages and not by_size:
         err("حدد --by-messages أو --by-size")
         raise SystemExit(1)
-
     data = parser.load(file)
     if out_dir is None:
         out_dir = OUT_DIR / f"{file.stem}_parts"
-
     if by_messages:
         files = splitter.split_by_messages(data, out_dir, by_messages, only, fmt)
     else:
         files = splitter.split_by_size(data, out_dir, by_size, only, fmt)
-
     ok(f"تم التقسيم: {len(files)} ملف في {out_dir}")
 
 
 @app.command()
 def paths(file: Path = typer.Argument(..., exists=True)):
-    """استخراج كل مسارات الملفات المذكورة في المحادثة."""
+    """استخراج مسارات الملفات."""
     data = parser.load(file)
     ps = analyzer.extract_paths(data)
     out = OUT_DIR / f"{file.stem}_paths.txt"
@@ -155,7 +150,7 @@ def paths(file: Path = typer.Argument(..., exists=True)):
 
 @app.command()
 def tree(file: Path = typer.Argument(..., exists=True)):
-    """استخراج شجرة المشروع (├── └──)."""
+    """استخراج شجرة المشروع."""
     data = parser.load(file)
     lines = analyzer.extract_tree(data)
     out = OUT_DIR / f"{file.stem}_tree.txt"
@@ -172,7 +167,7 @@ def keywords(
     file: Path = typer.Argument(..., exists=True),
     top: int = typer.Option(30, "--top", "-t"),
 ):
-    """أكثر الكلمات تكرارًا في المحادثة."""
+    """أكثر الكلمات تكرارًا."""
     data = parser.load(file)
     kws = analyzer.extract_keywords(data, top)
     table = Table("الكلمة", "التكرار")
@@ -194,6 +189,80 @@ def search(
         console.print(f"[cyan]#{i}[/cyan] [{role}] {snippet}")
     if len(hits) > 30:
         info(f"... و {len(hits) - 30} نتيجة أخرى")
+
+
+# ============ أوامر Koofr / rclone ============
+
+backup_app = typer.Typer(help="رفع/تنزيل/مزامنة مع Koofr عبر rclone")
+app.add_typer(backup_app, name="backup")
+
+
+@backup_app.command("check")
+def backup_check(remote: str = typer.Option("koofr-dsx", "--remote", "-r")):
+    """يتأكد إن الـ remote متظبط."""
+    if backup.is_configured(remote):
+        ok(f"rclone متظبط مع: {remote}")
+    else:
+        err(f"مش لاقي remote اسمه: {remote}")
+        info("شغل: rclone config")
+
+
+@backup_app.command("ls")
+def backup_ls(remote: str = typer.Option("koofr-dsx:dsx_backup", "--remote", "-r")):
+    """يعرض الملفات على Koofr."""
+    files = backup.list_files(remote)
+    if not files:
+        info("المجلد فاضي")
+        return
+    for f in files:
+        console.print(f"  • {f}")
+
+
+@backup_app.command("upload")
+def backup_upload(
+    path: Path = typer.Argument(...),
+    remote: str = typer.Option("koofr-dsx:dsx_backup", "--remote", "-r"),
+    dry: bool = typer.Option(False, "--dry-run"),
+):
+    """رفع ملف/مجلد محدد."""
+    backup.upload(path, remote, dry_run=dry)
+
+
+@backup_app.command("sync")
+def backup_sync(
+    remote: str = typer.Option("koofr-dsx:dsx_backup", "--remote", "-r"),
+    dry: bool = typer.Option(False, "--dry-run"),
+):
+    """مزامنة dsx_data كاملة."""
+    backup.sync_all(remote, dry_run=dry)
+
+
+@backup_app.command("push-output")
+def backup_push_output(
+    remote: str = typer.Option("koofr-dsx:dsx_backup/output", "--remote", "-r"),
+    dry: bool = typer.Option(False, "--dry-run"),
+):
+    """رفع مجلد المخرجات."""
+    backup.upload_output(remote, dry_run=dry)
+
+
+@backup_app.command("push-raw")
+def backup_push_raw(
+    remote: str = typer.Option("koofr-dsx:dsx_backup/raw", "--remote", "-r"),
+    dry: bool = typer.Option(False, "--dry-run"),
+):
+    """رفع JSON الخام."""
+    backup.upload_raw(remote, dry_run=dry)
+
+
+@backup_app.command("pull")
+def backup_pull(
+    remote_path: str = typer.Argument(...),
+    local: Path = typer.Argument(...),
+    remote: str = typer.Option("koofr-dsx:dsx_backup", "--remote", "-r"),
+):
+    """تنزيل من Koofr."""
+    backup.download(remote_path, local, remote)
 
 
 if __name__ == "__main__":
