@@ -5,7 +5,8 @@ from rich.table import Table
 
 from . import __version__
 from .utils import ensure_dirs, OUT_DIR, ok, err, info
-from . import fetcher, parser, extractor, splitter, analyzer, backup
+from . import fetcher, parser, extractor, splitter, analyzer, backup, exporter
+from . import timeline as timeline_mod
 
 app = typer.Typer(help="DeepSeek Chat Extractor CLI", add_completion=False)
 console = Console()
@@ -189,6 +190,71 @@ def search(
         console.print(f"[cyan]#{i}[/cyan] [{role}] {snippet}")
     if len(hits) > 30:
         info(f"... و {len(hits) - 30} نتيجة أخرى")
+
+
+@app.command()
+def export(
+    file: Path = typer.Argument(..., exists=True),
+    to: str = typer.Option("html", "--to", "-t", help="html|csv|json"),
+    only: str = typer.Option("clean", "--only", "-o"),
+    out: Path = typer.Option(None, "--out"),
+):
+    """تصدير المحادثة لـ HTML/CSV/JSON."""
+    ensure_dirs()
+    data = parser.load(file)
+    if out is None:
+        out = OUT_DIR / f"{file.stem}.{to}"
+    if to == "html":
+        exporter.export_html(data, out, only)
+    elif to == "csv":
+        exporter.export_csv(data, out, only)
+    elif to == "json":
+        exporter.export_plain_json(data, out, only)
+    else:
+        err(f"صيغة غير مدعومة: {to}")
+        raise SystemExit(1)
+    ok(f"تم التصدير: {out}")
+
+
+@app.command()
+def timeline(file: Path = typer.Argument(..., exists=True)):
+    """تحليل زمني للرسائل."""
+    data = parser.load(file)
+    d = timeline_mod.duration(data)
+    console.print("[bold]⏱️  المدة:[/bold]")
+    if d:
+        console.print(f"  البداية: {d['start']}")
+        console.print(f"  النهاية: {d['end']}")
+        console.print(f"  المدة: {d['duration_hours']} ساعة ({d['duration_min']} دقيقة)")
+
+    by_day = timeline_mod.messages_by_day(data)
+    if by_day:
+        table = Table("اليوم", "عدد الرسائل")
+        for day, c in by_day:
+            table.add_row(day, str(c))
+        console.print(table)
+
+
+@app.command()
+def grep(
+    directory: Path = typer.Argument(..., exists=True),
+    keyword: str = typer.Argument(...),
+):
+    """بحث بكلمة في كل الملفات النصية بمجلد."""
+    hits = 0
+    for f in sorted(directory.rglob("*.txt")) + sorted(directory.rglob("*.md")):
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if keyword.lower() in text.lower():
+            hits += 1
+            lines = text.splitlines()
+            matches = [(i, ln) for i, ln in enumerate(lines) if keyword.lower() in ln.lower()]
+            console.print(f"[bold cyan]{f.name}[/bold cyan] — {len(matches)} نتيجة")
+            for i, ln in matches[:3]:
+                console.print(f"  [dim]L{i}:[/dim] {ln.strip()[:120]}")
+    info(f"إجمالي الملفات المطابقة: {hits}")
 
 
 # ============ أوامر Koofr / rclone ============
